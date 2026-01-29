@@ -1,0 +1,129 @@
+name: Build Cppcheck
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - '.tool_version'
+      - '.github/workflows/build.yml'
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  read-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(cat .tool_version | tr -d '[:space:]')
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Cppcheck version: ${VERSION}"
+
+  build:
+    needs: read-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x64
+            artifact_name: cppcheck-linux-x64
+          - os: ubuntu-24.04-arm
+            arch: arm
+            artifact_name: cppcheck-linux-arm64
+          - os: macos-14
+            arch: arm64
+            artifact_name: cppcheck-macos-arm64
+
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.read-version.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake make g++ libpcre3-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake pcre
+
+      - name: Download cppcheck source
+        run: |
+          curl -L -o cppcheck.zip "https://github.com/danmar/cppcheck/archive/refs/tags/${VERSION}.zip"
+          unzip cppcheck.zip
+          mv "cppcheck-${VERSION}" cppcheck-src
+
+      - name: Build cppcheck
+        run: |
+          cd cppcheck-src
+          mkdir build
+          cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DHAVE_RULES=ON \
+            -DUSE_MATCHCOMPILER=ON \
+            -DBUILD_GUI=OFF \
+            -DBUILD_TESTS=OFF \
+            -DCMAKE_INSTALL_PREFIX=/usr/local
+          make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist/cppcheck
+          cp cppcheck-src/build/bin/cppcheck dist/cppcheck/
+          cp -r cppcheck-src/cfg dist/cppcheck/
+          cp -r cppcheck-src/addons dist/cppcheck/
+          cd dist
+          tar -czvf "../${{ matrix.artifact_name }}-${VERSION}.tar.gz" cppcheck
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}-${{ env.VERSION }}
+          path: ${{ matrix.artifact_name }}-${{ env.VERSION }}.tar.gz
+          retention-days: 90
+
+  release:
+    needs: [read-version, build]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.read-version.outputs.version }}
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: Cppcheck ${{ env.VERSION }}
+          body: |
+            Cppcheck ${{ env.VERSION }} binaries
+
+            ## Artifacts
+            - `cppcheck-linux-x64-${{ env.VERSION }}.tar.gz` - Linux x64
+            - `cppcheck-linux-arm64-${{ env.VERSION }}.tar.gz` - Linux ARM64
+            - `cppcheck-macos-arm64-${{ env.VERSION }}.tar.gz` - macOS ARM64
+          files: |
+            artifacts/**/*.tar.gz
+          fail_on_unmatched_files: true
